@@ -1,9 +1,8 @@
 # fastapi_attendance_app.py
-
-from typing import Optional, List, Any
+from typing import Optional, List, Tuple
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from pathlib import Path
 from datetime import datetime, date
 import sqlite3
@@ -12,20 +11,29 @@ import io
 import os
 from PIL import Image
 import numpy as np
+import logging
 
+# ------------------------------------------------------------
+# Config
+# ------------------------------------------------------------
 DB_PATH = "attendance_demo.db"
 IMAGES_DIR = Path("images")
 IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 
+# InsightFace model name to use (smaller models are kinder to limited RAM)
+INSIGHT_MODEL = "buffalo_s"  # try "buffalo_s", "antelope"; "buffalo_l" is larger
+
+# If True: require InsightFace to be available (raise 500 if not).
+# If False: fall back to the deterministic stub embedding (recognition will be poor).
+REQUIRE_INSIGHT = True
+
+# Default matching threshold (you should compute a data-driven value using analyzer scripts)
+DEFAULT_THRESHOLD = 0.70
+
+# ------------------------------------------------------------
+# App + logging
+# ------------------------------------------------------------
 app = FastAPI(title="Face Recognition Attendance Backend")
-from fastapi.responses import RedirectResponse
-
-@app.get("/")
-def root_redirect():
-    # redirect root to the interactive docs
-    return RedirectResponse(url="/docs")
-
-# Dev-time CORS: allow all origins (you can restrict later)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -34,17 +42,25 @@ app.add_middleware(
     allow_credentials=True,
 )
 
+# Use uvicorn logger for stdout capture on Render
+logger = logging.getLogger("uvicorn.error")
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO)
+
+# ------------------------------------------------------------
+# DB helper
+# ------------------------------------------------------------
 def get_db_conn():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON;")
     return conn
 
-# ---------------------------
-# Embedding computation
-# ---------------------------
+# ------------------------------------------------------------
+# Stub embedding (fallback)
+# ------------------------------------------------------------
 def _stub_embedding(bytes_data: bytes) -> List[float]:
-    """Very small deterministic stub (keeps server running if no ML lib)."""
+    """Deterministic, low-quality embedding used as fallback so server doesn't crash."""
     try:
         im = Image.open(io.BytesIO(bytes_data)).convert("L").resize((64, 64))
         arr = np.asarray(im, dtype=np.float32) / 255.0
@@ -52,60 +68,121 @@ def _stub_embedding(bytes_data: bytes) -> List[float]:
     except Exception:
         return []
 
-def compute_embedding(image_bytes: bytes) -> List[float]:
+# ------------------------------------------------------------
+# InsightFace initialization (lazy + logged)
+# ------------------------------------------------------------
+_insight_app = None
+_insight_available = False
+_insight_error = None
+
+def init_insightface(model_name: str = INSIGHT_MODEL):
     """
-    Try InsightFace (recommended). If not available or fails, fall back to stub.
-    Returns a list of floats (embedding) or empty list if no face found.
+    Attempt to initialize InsightFace FaceAnalysis and log results.
+    Call at import/startup and before compute_embedding.
     """
-    # Lazy import & caching of InsightFace model instance
+    global _insight_app, _insight_available, _insight_error
+    if _insight_app is not None or _insight_available:
+        return
+
     try:
-        # local import so missing package doesn't crash startup
+        # lazy import
         from insightface.app import FaceAnalysis  # type: ignore
-        global _insight_app  # cached across calls
-        if "_insight_app" not in globals():
-            # model name buffalo_l is a good CPU model; ctx_id=-1 -> CPU
-            _insight_app = FaceAnalysis(name="buffalo_l")
-            _insight_app.prepare(ctx_id=-1)
-        # convert bytes -> RGB numpy array
-        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        img_np = np.asarray(img)
-        faces = _insight_app.get(img_np)
-        if not faces:
-            return []
-        emb = faces[0].embedding
-        # ensure Python list of floats
-        return emb.tolist() if hasattr(emb, "tolist") else [float(x) for x in emb]
-    except Exception as exc:
-        # fallback to stub (prints minimal debug to server console)
-        print("InsightFace error or not installed — using stub:", str(exc))
+        logger.info("Attempting to initialize InsightFace model: %s", model_name)
+        _insight_app = FaceAnalysis(name=model_name)
+        # use CPU on Render / general hosts
+        _insight_app.prepare(ctx_id=-1)
+        _insight_available = True
+        _insight_error = None
+        logger.info("InsightFace initialized successfully: %s", model_name)
+    except Exception as e:
+        _insight_app = None
+        _insight_available = False
+        _insight_error = str(e)
+        logger.error("InsightFace initialization failed: %s", _insight_error)
+
+# init at import so render logs show startup behavior
+init_insightface()
+
+@app.get("/debug_model")
+def debug_model():
+    """Return model load status and error message (if any)."""
+    return {
+        "insight_available": bool(_insight_available),
+        "insight_error": _insight_error,
+        "model_obj": type(_insight_app).__name__ if _insight_app else None,
+        "insight_model_name": INSIGHT_MODEL
+    }
+
+# ------------------------------------------------------------
+# Embedding computation
+# ------------------------------------------------------------
+def compute_embedding(image_bytes: bytes, require_insight: Optional[bool] = None) -> List[float]:
+    """
+    Compute embedding for given image bytes.
+    - If InsightFace is available, uses it.
+    - If not available:
+        - If require_insight True -> raises HTTPException(500)
+        - If require_insight False -> returns stub embedding
+    """
+    if require_insight is None:
+        require_insight = REQUIRE_INSIGHT
+
+    # Ensure init attempted
+    init_insightface()
+
+    if _insight_available and _insight_app is not None:
+        try:
+            img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+            img_np = np.asarray(img)
+            faces = _insight_app.get(img_np)
+            if not faces:
+                logger.info("No faces detected by InsightFace.")
+                return []
+            # pick largest face for robustness
+            face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+            emb = face.embedding
+            vec = emb.tolist() if hasattr(emb, "tolist") else [float(x) for x in emb]
+            logger.info("Computed embedding (len=%d) with InsightFace.", len(vec))
+            return vec
+        except Exception as e:
+            logger.error("InsightFace compute failed: %s", repr(e))
+            if require_insight:
+                raise HTTPException(status_code=500, detail="InsightFace embedding generation failed: " + str(e))
+            else:
+                logger.warning("Falling back to stub embedding due to compute error.")
+                return _stub_embedding(image_bytes)
+    else:
+        msg = f"InsightFace not available: {_insight_error}"
+        logger.warning(msg)
+        if require_insight:
+            raise HTTPException(status_code=500, detail=msg)
         return _stub_embedding(image_bytes)
 
+# ------------------------------------------------------------
+# Similarity utils
+# ------------------------------------------------------------
 def cosine_similarity(a: List[float], b: List[float]) -> float:
-    """
-    Safe cosine similarity:
-    - Converts inputs to 1-D numpy arrays
-    - Returns 0.0 for empty vectors, mismatched lengths, zero-norm, or on any error
-    """
     try:
         a_arr = np.asarray(a, dtype=np.float32).reshape(-1)
         b_arr = np.asarray(b, dtype=np.float32).reshape(-1)
-        # if either is empty or lengths differ, return 0.0 (no-match)
         if a_arr.size == 0 or b_arr.size == 0:
             return 0.0
         if a_arr.size != b_arr.size:
-            # don't attempt dot on different sizes
             return 0.0
         denom = np.linalg.norm(a_arr) * np.linalg.norm(b_arr)
         if denom == 0.0:
             return 0.0
         return float(np.dot(a_arr, b_arr) / denom)
     except Exception as e:
-        # log to server console for debugging, but don't crash
-        print("cosine_similarity error:", repr(e))
+        logger.error("cosine_similarity error: %s", repr(e))
         return 0.0
 
-def ping():
-    return {"status": "ok"}
+# ------------------------------------------------------------
+# Endpoints: users / enroll / recognize / attendance
+# ------------------------------------------------------------
+@app.get("/")
+def root_redirect():
+    return RedirectResponse(url="/docs")
 
 @app.get("/users")
 def list_users():
@@ -135,11 +212,10 @@ async def enroll(
         raise HTTPException(status_code=500, detail=f"Failed to save image: {e}")
 
     # compute embedding (InsightFace preferred)
-    vec = compute_embedding(content)
+    vec = compute_embedding(content, require_insight=REQUIRE_INSIGHT)
 
     conn = get_db_conn()
     cur = conn.cursor()
-    # create or ignore user
     cur.execute("INSERT OR IGNORE INTO users (code, name, email) VALUES (?, ?, ?)", (code, name, email))
     conn.commit()
 
@@ -150,17 +226,15 @@ async def enroll(
         raise HTTPException(status_code=500, detail="Failed to create or find user")
     user_id = row["id"]
 
-    # insert user_images
     cur.execute("INSERT INTO user_images (user_id, image_url) VALUES (?, ?)", (user_id, str(out_path)))
     conn.commit()
     cur.execute("SELECT id FROM user_images WHERE user_id = ? AND image_url = ?", (user_id, str(out_path)))
     ui_row = cur.fetchone()
     user_image_id = ui_row["id"]
 
-    # save embedding (even if empty - useful to detect later)
     cur.execute(
         "INSERT OR REPLACE INTO embeddings (user_image_id, model, vector_json) VALUES (?, ?, ?)",
-        (user_image_id, "insightface_or_stub", json.dumps(vec)),
+        (user_image_id, INSIGHT_MODEL if _insight_available else "stub", json.dumps(vec)),
     )
     conn.commit()
     conn.close()
@@ -168,9 +242,10 @@ async def enroll(
     return {"status": "ok", "user_id": user_id, "image_path": str(out_path), "embedding_len": len(vec)}
 
 @app.post("/recognize")
-async def recognize(file: UploadFile = File(...), threshold: float = 0.6, top_k: int = 1):
+async def recognize(file: UploadFile = File(...), threshold: float = DEFAULT_THRESHOLD, top_k: int = 1):
     contents = await file.read()
-    query_vec = compute_embedding(contents)
+    # compute probe embedding (raises 500 if model required but not available)
+    query_vec = compute_embedding(contents, require_insight=REQUIRE_INSIGHT)
     if len(query_vec) == 0:
         raise HTTPException(status_code=400, detail="Could not compute embedding (no face detected?)")
 
@@ -191,19 +266,10 @@ async def recognize(file: UploadFile = File(...), threshold: float = 0.6, top_k:
             stored_vec = json.loads(r["vector_json"]) if r["vector_json"] else []
         except Exception:
             stored_vec = []
-        try:
-            # stored_vec should be a flat list of floats; ensure it's a list
-            if not stored_vec or not isinstance(stored_vec, list):
-                score = 0.0
-            else:
-                score = cosine_similarity(query_vec, stored_vec)
-        except Exception as e:
-            try:
-                uid = r["user_id"]
-            except Exception:
-                uid = None
-            print("Error computing score for user", uid, ":", repr(e))
+        if not stored_vec or not isinstance(stored_vec, list):
             score = 0.0
+        else:
+            score = cosine_similarity(query_vec, stored_vec)
         candidates.append(
             {
                 "user_id": r["user_id"],
@@ -219,7 +285,7 @@ async def recognize(file: UploadFile = File(...), threshold: float = 0.6, top_k:
     best = candidates[0] if candidates else None
     matched = bool(best and best["score"] >= threshold)
 
-    # optionally mark attendance if matched
+    # mark attendance if matched
     if matched:
         try:
             conn2 = get_db_conn()
@@ -233,7 +299,7 @@ async def recognize(file: UploadFile = File(...), threshold: float = 0.6, top_k:
             conn2.commit()
             conn2.close()
         except Exception as e:
-            print("Warning: failed to write attendance:", e)
+            logger.warning("Warning: failed to write attendance: %s", e)
 
     conn.close()
     return JSONResponse({"matched": matched, "best_score": best["score"] if best else None, "candidates": candidates[:top_k], "marked_attendance": matched})
@@ -257,3 +323,9 @@ def view_attendance():
     conn.close()
     return {"date": today, "count": len(rows), "records": rows}
 
+# ------------------------------------------------------------
+# Simple health/ping endpoint
+# ------------------------------------------------------------
+@app.get("/ping")
+def ping():
+    return {"status": "ok", "insight_available": bool(_insight_available)}
