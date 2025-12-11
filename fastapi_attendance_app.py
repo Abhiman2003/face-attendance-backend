@@ -18,6 +18,12 @@ IMAGES_DIR = Path("images")
 IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="Face Recognition Attendance Backend")
+from fastapi.responses import RedirectResponse
+
+@app.get("/")
+def root_redirect():
+    # redirect root to the interactive docs
+    return RedirectResponse(url="/docs")
 
 # Dev-time CORS: allow all origins (you can restrict later)
 app.add_middleware(
