@@ -1,4 +1,5 @@
 # fastapi_attendance_app.py
+
 from typing import Optional, List, Any
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
