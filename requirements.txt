@@ -6,3 +6,5 @@ numpy
 opencv-python-headless
 requests
 insightface
+onnxruntime==1.16.1
+opencv-python-headless==4.7.0.72
