@@ -1,3 +1,28 @@
+
+cat > .gitignore <<'EOF'
+# Python caches
+__pycache__/
+*.pyc
+
+# Database files (do NOT commit)
+*.db
+*.db.bak
+attendance_demo.db
+attendance_demo_backup*.db
+archived_dbs/
+
+# Model files / heavy folders (do NOT commit)
+insightface/
+models/
+*.onnx
+
+# Logs
+*.log
+
+# Virtual env
+venv/
+env/
+*.env
+
+# OS files
 .DS_Store
-fastapi_attendance_app.py.bak
-attendance_demo.db.bak
