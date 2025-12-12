@@ -5,3 +5,4 @@ numpy
 insightface
 onnxruntime==1.23.2
 opencv-python-headless==4.7.0.72
+python-multipart
